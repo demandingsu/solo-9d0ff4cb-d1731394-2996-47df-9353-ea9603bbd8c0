@@ -122,6 +122,24 @@ CREATE TABLE IF NOT EXISTS export_text_hashes (
 CREATE INDEX IF NOT EXISTS idx_export_text_hashes_hash
     ON export_text_hashes(text_hash);
 
+-- One row per authorized download ("领用"). The row is born 'delivering';
+-- only a complete server-side read makes it 'delivered'. Interrupted reads
+-- and rows left behind by a restart become 'unconfirmed' and still count as
+-- possibly handed to downstream when a revocation lists its impact.
+CREATE TABLE IF NOT EXISTS requisitions (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    export_id     INTEGER NOT NULL REFERENCES exports(id) ON DELETE CASCADE,
+    recipient_id  TEXT NOT NULL,
+    status        TEXT NOT NULL CHECK (status IN
+                    ('delivering', 'delivered', 'unconfirmed')),
+    requested_at  TEXT NOT NULL,
+    finished_at   TEXT,
+    bytes_sent    INTEGER NOT NULL DEFAULT 0,
+    note          TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_requisitions_export ON requisitions(export_id);
+
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL

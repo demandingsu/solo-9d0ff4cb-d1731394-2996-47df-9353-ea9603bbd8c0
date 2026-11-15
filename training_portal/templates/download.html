@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>领用登记 · 访谈语料训练分发平台</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="masthead">
+    <div class="wrap">
+      <h1>领用登记</h1>
+      <p class="sub">下载训练 CSV 前须登记接收编号 · 授权核验与领用登记关联同一导出</p>
+    </div>
+  </header>
+
+  <main class="wrap">
+    {% if error %}<div class="flash flash-error">{{ error }}</div>{% endif %}
+
+    {% if export %}
+    <section class="card">
+      <h2>导出文件</h2>
+      <p class="hint">
+        文件 <code>{{ export.download_name }}</code> · 批次 {{ export.batch }} ·
+        {{ export.row_count }} 行 · 状态「{{ export.status | status_label }}」
+      </p>
+      {% if export.status == 'ready' %}
+      <form method="post" action="/download/{{ export.id }}" class="stack">
+        <label class="field">
+          <span>接收编号：</span>
+          <input type="text" name="recipient_id" required maxlength="200"
+                 placeholder="例如 DOWN-2026-0001" autofocus>
+        </label>
+        <div class="row">
+          <button type="submit" class="btn">登记并下载</button>
+          <a class="btn btn-ghost" href="/">返回首页</a>
+        </div>
+      </form>
+      <p class="hint small">
+        每次下载都会留下一条领用记录（重复领用各记一次）；服务端完整读出后标记「已交付」，
+        读取中断或服务重启则标记「交付未确认」，两种记录都会列入撤回影响范围。
+      </p>
+      {% else %}
+      <p class="hint">
+        该文件当前不可下载。
+        {% if export.purge_reason %}原因：{{ export.purge_reason }}。{% endif %}
+      </p>
+      <div class="row"><a class="btn btn-ghost" href="/">返回首页</a></div>
+      {% endif %}
+    </section>
+    {% else %}
+    <section class="card">
+      <p class="hint">导出文件不存在。</p>
+      <div class="row"><a class="btn btn-ghost" href="/">返回首页</a></div>
+    </section>
+    {% endif %}
+  </main>
+</body>
+</html>

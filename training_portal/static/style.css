@@ -158,13 +158,13 @@ tbody tr:hover { background: #1b1f28; }
   color: var(--muted);
   white-space: nowrap;
 }
-.pill-ready, .pill-completed { color: #b9f2d3; border-color: #2f5d47; background: #14241c; }
-.pill-pending_delete, .pill-paused, .pill-queued, .pill-running {
+.pill-ready, .pill-completed, .pill-delivered { color: #b9f2d3; border-color: #2f5d47; background: #14241c; }
+.pill-pending_delete, .pill-paused, .pill-queued, .pill-running, .pill-delivering {
   color: #ffe8b0;
   border-color: #6d4c1f;
   background: #241d12;
 }
-.pill-blocked, .pill-failed, .pill-deleted { color: #ffc2c6; border-color: #6a2f34; background: #2a1518; }
+.pill-blocked, .pill-failed, .pill-deleted, .pill-unconfirmed { color: #ffc2c6; border-color: #6a2f34; background: #2a1518; }
 
 .notes {
   border: 1px solid var(--line);

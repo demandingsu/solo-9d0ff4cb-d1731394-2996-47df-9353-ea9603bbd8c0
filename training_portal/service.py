@@ -42,6 +42,21 @@ class ParsedRow:
     text: str
 
 
+@dataclass
+class DownloadTicket:
+    """Result of one registered download attempt.
+
+    ``file`` is only set when the download was authorized; ``requisition_id``
+    identifies the ledger row that must be closed with ``finish_download``.
+    """
+
+    file: BinaryIO | None
+    download_name: str
+    requisition_id: int | None
+    size_bytes: int
+    error: str | None
+
+
 def text_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -136,6 +151,7 @@ class Portal:
         self._publish_lock = threading.Lock()
         self._threads: list[threading.Thread] = []
         self._recover_interrupted_jobs()
+        self._recover_interrupted_deliveries()
         self._sweep_orphans()
 
     # ------------------------------------------------------------------
@@ -183,6 +199,21 @@ class Portal:
                     utc_now(),
                     "服务重启中断了本次生成，未发布任何文件，请重新提交该批次",
                 ),
+            )
+
+    def _recover_interrupted_deliveries(self) -> None:
+        """Mark requisitions a previous process left mid-stream as unconfirmed.
+
+        A crash between authorization and the last byte leaves a ``delivering``
+        row behind. Whether the recipient got the whole file is unknowable, so
+        the record stays as ``unconfirmed`` and keeps counting toward the
+        impact list of any later revocation.
+        """
+        with self.db.transaction() as conn:
+            conn.execute(
+                "UPDATE requisitions SET status = 'unconfirmed', note = ? "
+                "WHERE status = 'delivering'",
+                ("服务重启时交付中断，是否送达未确认",),
             )
 
     def _sweep_orphans(self) -> None:
@@ -737,25 +768,33 @@ class Portal:
                     _unlink_quietly(final_path)
 
     # ------------------------------------------------------------------
-    # download gate
+    # download gate / requisition ledger
     # ------------------------------------------------------------------
-    def open_download(self, export_id: int) -> tuple[BinaryIO | None, str, str | None]:
-        """Return ``(file, download_name, error)`` for one export.
+    def register_download(self, export_id: int, recipient_id: str) -> DownloadTicket:
+        """Authorize one download and register its requisition atomically.
 
-        The consent check and the file open happen inside one write transaction:
-        a download either linearizes before a revocation (and may finish, since
-        its descriptor is already open) or after it (and is refused). The cleanup
-        worker takes the same write lock before unlinking, so it cannot pull the
-        file from under an fd that was just authorized.
+        The consent re-check, the requisition insert and the file open happen
+        inside one write transaction, all bound to the same export: a download
+        either linearizes before a revocation (and may finish, since its
+        descriptor is already open) or after it (and is refused). Every
+        authorized attempt inserts exactly one ledger row in ``delivering``
+        state, so repeated downloads are each recorded and an in-flight
+        download authorized before a revocation still leaves its record.
         """
+        recipient_id = recipient_id.strip()
+        if not recipient_id:
+            raise ValidationError("请填写接收编号")
+        if len(recipient_id) > 200:
+            raise ValidationError("接收编号不能超过 200 个字符")
+
         with self.db.transaction() as conn:
             export = conn.execute(
                 "SELECT * FROM exports WHERE id = ?", (export_id,)
             ).fetchone()
             if export is None:
-                return None, "", "导出文件不存在"
+                return DownloadTicket(None, "", None, 0, "导出文件不存在")
             if export["status"] == "deleted":
-                return None, "", "文件已按撤回要求删除"
+                return DownloadTicket(None, "", None, 0, "文件已按撤回要求删除")
 
             revoked_ids = {
                 row["respondent_id"]
@@ -798,18 +837,52 @@ class Portal:
 
             if locked:
                 file = None
+                requisition_id = None
             elif export["status"] != "ready":
-                return None, "", "文件待清理，暂不可下载"
+                return DownloadTicket(None, "", None, 0, "文件待清理，暂不可下载")
             else:
                 try:
                     file = (self.export_dir / export["stored_name"]).open("rb")
                 except OSError:
-                    return None, "", "文件已不可用"
+                    return DownloadTicket(None, "", None, 0, "文件已不可用")
+                cursor = conn.execute(
+                    "INSERT INTO requisitions(export_id, recipient_id, status, "
+                    "requested_at) VALUES (?, ?, 'delivering', ?)",
+                    (export_id, recipient_id, utc_now()),
+                )
+                requisition_id = int(cursor.lastrowid)
 
         if locked:
             self.kick_cleanup()
-            return None, "", "该导出涉及已撤回授权，已禁止下载并转入清理"
-        return file, export["download_name"], None
+            return DownloadTicket(
+                None, "", None, 0, "该导出涉及已撤回授权，已禁止下载并转入清理"
+            )
+        return DownloadTicket(
+            file,
+            export["download_name"],
+            requisition_id,
+            int(export["size_bytes"]),
+            None,
+        )
+
+    def finish_download(
+        self, requisition_id: int, bytes_sent: int, complete: bool
+    ) -> None:
+        """Close a requisition after the server finished reading the file.
+
+        Only a complete read (every byte of the export streamed out) earns the
+        ``delivered`` mark. A short or interrupted read leaves the record
+        ``unconfirmed``: the recipient may hold a partial or complete copy and
+        the file must stay on the recall list.
+        """
+        status = "delivered" if complete else "unconfirmed"
+        note = None if complete else "读取中断，是否送达未确认"
+        with self.db.transaction() as conn:
+            conn.execute(
+                "UPDATE requisitions SET status = ?, finished_at = ?, "
+                "bytes_sent = ?, note = ? WHERE id = ? AND status = 'delivering'",
+                (status, utc_now(), bytes_sent, note, requisition_id),
+            )
 
     # ------------------------------------------------------------------
     # deletion / cleanup
@@ -969,6 +1042,100 @@ class Portal:
                 "SELECT * FROM exports ORDER BY id DESC LIMIT ?", (limit,)
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def export(self, export_id: int) -> dict[str, Any] | None:
+        with self.db.read() as conn:
+            row = conn.execute(
+                "SELECT * FROM exports WHERE id = ?", (export_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def requisitions(self, limit: int = 30) -> list[dict[str, Any]]:
+        with self.db.read() as conn:
+            rows = conn.execute(
+                "SELECT r.*, e.download_name, e.batch FROM requisitions r "
+                "JOIN exports e ON e.id = r.export_id "
+                "ORDER BY r.id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def revocation_detail(self, respondent_id: str) -> dict[str, Any] | None:
+        """Requisition ledger for every export a revocation touches.
+
+        An export is related when it contains the respondent's rows *or* the
+        hash of one of their withdrawn texts (the same utterance may circulate
+        under a different respondent id). Every requisition of those exports is
+        listed - delivered, unconfirmed and in-flight alike - so the data
+        steward knows exactly which recipients to call back. The withdrawn
+        text itself is long deleted and never included here.
+        """
+        with self.db.read() as conn:
+            revocation = conn.execute(
+                "SELECT * FROM revocations WHERE respondent_id = ?", (respondent_id,)
+            ).fetchone()
+            if revocation is None:
+                return None
+
+            hashes = [
+                row["text_hash"]
+                for row in conn.execute(
+                    "SELECT text_hash FROM revoked_text_hashes "
+                    "WHERE respondent_id = ?",
+                    (respondent_id,),
+                )
+            ]
+            export_ids = {
+                int(row["export_id"])
+                for row in conn.execute(
+                    "SELECT export_id FROM export_respondents "
+                    "WHERE respondent_id = ?",
+                    (respondent_id,),
+                )
+            }
+            if hashes:
+                placeholders = ",".join("?" for _ in hashes)
+                export_ids.update(
+                    int(row["export_id"])
+                    for row in conn.execute(
+                        "SELECT export_id FROM export_text_hashes "
+                        f"WHERE text_hash IN ({placeholders})",
+                        tuple(hashes),
+                    )
+                )
+
+            exports: list[dict[str, Any]] = []
+            requisitions_by_export: dict[int, list[dict[str, Any]]] = {}
+            if export_ids:
+                ordered = sorted(export_ids)
+                placeholders = ",".join("?" for _ in ordered)
+                exports = [
+                    dict(row)
+                    for row in conn.execute(
+                        f"SELECT * FROM exports WHERE id IN ({placeholders}) "
+                        "ORDER BY id",
+                        tuple(ordered),
+                    )
+                ]
+                for row in conn.execute(
+                    f"SELECT * FROM requisitions WHERE export_id IN ({placeholders}) "
+                    "ORDER BY requested_at, id",
+                    tuple(ordered),
+                ):
+                    requisitions_by_export.setdefault(int(row["export_id"]), []).append(
+                        dict(row)
+                    )
+
+        return {
+            "revocation": dict(revocation),
+            "exports": [
+                {
+                    "export": export,
+                    "requisitions": requisitions_by_export.get(int(export["id"]), []),
+                }
+                for export in exports
+            ],
+        }
 
     def uploads(self, limit: int = 8) -> list[dict[str, Any]]:
         with self.db.read() as conn:

@@ -33,6 +33,9 @@ STATUS_LABELS = {
     "ready": "可下载",
     "pending_delete": "待清理",
     "deleted": "已删除",
+    "delivering": "交付中",
+    "delivered": "已交付",
+    "unconfirmed": "交付未确认",
 }
 
 portal = Portal(DATA_DIR)
@@ -77,7 +80,7 @@ def _sample_path(name: str) -> Path:
     return candidate
 
 
-def render(request: Request, template: str, **context: object):
+def render(request: Request, template: str, status_code: int = 200, **context: object):
     base = {
         "request": request,
         "samples": _sample_files(),
@@ -85,7 +88,9 @@ def render(request: Request, template: str, **context: object):
         "stats": portal.stats(),
         "pending": portal.pending_cleanup_count(),
     }
-    return templates.TemplateResponse(request, template, {**base, **context})
+    return templates.TemplateResponse(
+        request, template, {**base, **context}, status_code=status_code
+    )
 
 
 def page(request: Request, **context: object):
@@ -97,6 +102,7 @@ def page(request: Request, **context: object):
         exports=portal.exports(),
         revocations=portal.revocations(),
         uploads=portal.uploads(),
+        requisitions=portal.requisitions(),
         **context,
     )
 
@@ -202,28 +208,76 @@ def cleanup_retry(request: Request):
         return page(request, error=str(exc))
 
 
-@app.get("/download/{export_id}")
-def download(export_id: int):
-    handle, name, error = portal.open_download(export_id)
-    if error or handle is None:
-        return JSONResponse(
-            {"ok": False, "error": error or "无法下载"},
-            status_code=410 if "撤回" in (error or "") else 404,
+def _download_form(request: Request, export_id: int, status_code: int = 200, **context: object):
+    return render(
+        request,
+        "download.html",
+        status_code=status_code,
+        export=portal.export(export_id),
+        **context,
+    )
+
+
+@app.get("/download/{export_id}", response_class=HTMLResponse)
+def download_form(request: Request, export_id: int):
+    """The old direct link now only serves the registration form.
+
+    The file itself is never returned here: every download must go through
+    the POST below, which binds the consent check and the requisition
+    registration to the same export in one transaction.
+    """
+    export = portal.export(export_id)
+    if export is None:
+        return _download_form(request, export_id, status_code=404)
+    if export["status"] != "ready":
+        return _download_form(request, export_id, status_code=410)
+    return _download_form(request, export_id)
+
+
+@app.post("/download/{export_id}")
+def download(request: Request, export_id: int, recipient_id: str = Form("")):
+    try:
+        ticket = portal.register_download(export_id, recipient_id)
+    except ValidationError as exc:
+        return _download_form(request, export_id, status_code=400, error=str(exc))
+    if ticket.error or ticket.file is None:
+        status_code = 410 if "撤回" in (ticket.error or "") else 404
+        return _download_form(
+            request, export_id, status_code=status_code, error=ticket.error
         )
 
+    handle = ticket.file
+    expected = ticket.size_bytes
+    requisition_id = ticket.requisition_id
+
     def body():
+        sent = 0
+        complete = False
         try:
             while chunk := handle.read(64 * 1024):
+                sent += len(chunk)
                 yield chunk
+            # Only a full server-side read counts as handed over.
+            complete = sent == expected
         finally:
             handle.close()
+            if requisition_id is not None:
+                portal.finish_download(requisition_id, sent, complete)
 
     headers = {
-        "Content-Disposition": _attachment_header(name),
+        "Content-Disposition": _attachment_header(ticket.download_name),
         "Cache-Control": "no-store, no-cache, must-revalidate",
         "X-Content-Type-Options": "nosniff",
     }
     return StreamingResponse(body(), media_type="text/csv", headers=headers)
+
+
+@app.get("/revocations/{respondent_id}", response_class=HTMLResponse)
+def revocation_detail(request: Request, respondent_id: str):
+    detail = portal.revocation_detail(respondent_id)
+    if detail is None:
+        return page(request, error=f"没有找到受访者 {respondent_id} 的撤回记录")
+    return render(request, "revocation.html", detail=detail)
 
 
 def _attachment_header(name: str) -> str:

@@ -134,7 +134,7 @@
 
     <section class="card wide">
       <h2>导出文件</h2>
-      <p class="hint small">「可下载」的后端会再次校验授权；「待清理」表示文件已禁止下载、正等待删除，重启后清理继续。</p>
+      <p class="hint small">「可下载」的导出须先登记接收编号才能下载，后端会现场复核授权；「待清理」表示文件已禁止下载、正等待删除，重启后清理继续。</p>
       <div class="tablewrap">
         <table>
           <thead>
@@ -165,12 +165,39 @@
       </div>
     </section>
 
+    <section class="card wide">
+      <h2>领用记录</h2>
+      <p class="hint small">每次下载前须登记接收编号，授权核验与领用登记关联同一导出；服务端完整读出标记「已交付」，读取中断或服务重启遗留的记录标记「交付未确认」，仍列入撤回影响。</p>
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr><th>接收编号</th><th>导出文件</th><th>批次</th><th>状态</th><th>登记时间</th><th>完成时间</th><th>说明</th></tr>
+          </thead>
+          <tbody>
+            {% for q in requisitions %}
+            <tr>
+              <td class="mono">{{ q.recipient_id }}</td>
+              <td class="mono">{{ q.download_name }}</td>
+              <td>{{ q.batch }}</td>
+              <td><span class="pill pill-{{ q.status }}">{{ q.status | status_label }}</span></td>
+              <td class="mono">{{ q.requested_at | short_time }}</td>
+              <td class="mono">{{ q.finished_at | short_time }}</td>
+              <td class="msg">{{ q.note or "" }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="7" class="empty">暂无领用记录</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
     <div class="grid">
       <section class="card">
         <h2>已撤回编号</h2>
         <div class="tablewrap">
           <table>
-            <thead><tr><th>编号</th><th>撤回时间</th><th>删除语料</th><th>锁定文件</th></tr></thead>
+            <thead><tr><th>编号</th><th>撤回时间</th><th>删除语料</th><th>锁定文件</th><th>领用详情</th></tr></thead>
             <tbody>
               {% for r in revocations %}
               <tr>
@@ -178,9 +205,10 @@
                 <td class="mono">{{ r.revoked_at | short_time }}</td>
                 <td>{{ r.deleted_rows }} 行</td>
                 <td>{{ r.affected_exports }} 个</td>
+                <td><a class="btn btn-small btn-ghost" href="/revocations/{{ r.respondent_id | urlencode }}">查看</a></td>
               </tr>
               {% else %}
-              <tr><td colspan="4" class="empty">暂无撤回记录</td></tr>
+              <tr><td colspan="5" class="empty">暂无撤回记录</td></tr>
               {% endfor %}
             </tbody>
           </table>
@@ -218,6 +246,9 @@
         <li><strong>生成中撤回：</strong>生成按 20 行一个分块，每块前重读撤回表；批次内任一编号被撤回即中止整个任务（其文本与其他语料交错，只删其行仍会泄漏），结果不发布。</li>
         <li><strong>发布前闸门：</strong>临时文件先改名为正式文件，随后在同一事务中复核撤回并写入导出记录；若撤回已发生，文件立即删除，任务标记「已阻止」。</li>
         <li><strong>下载时校验：</strong>每次下载都在写事务中比对撤回表与导出所含编号，命中即锁定该文件、返回拒绝并触发清理。</li>
+        <li><strong>领用先登记：</strong>下载前必须填写接收编号，授权核验与领用登记在同一事务中关联同一导出；直达链接只打开登记页，不能绕过登记直接取文件。重复领用各记一次。</li>
+        <li><strong>交付状态：</strong>服务端完整读出文件才记「已交付」；读取中断或服务重启遗留的记录显示「交付未确认」，与已交付一样列入撤回影响。</li>
+        <li><strong>撤回详情：</strong>按受访者列出相关导出（含换号使用同一被撤回文本的导出）的接收编号、时间与状态，据此通知下游回收；页面不展示已撤回正文。</li>
         <li><strong>删除失败 → 待清理：</strong>删除失败留下 <code>pending_delete</code> 记录（累计尝试次数与错误信息），该状态永不可下载；后台清理器与启动扫描持续重试。被删除前的残留临时文件与无主文件在启动时一并清除。</li>
       </ul>
     </section>

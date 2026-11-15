@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>撤回详情 · 访谈语料训练分发平台</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="masthead">
+    <div class="wrap">
+      <h1>撤回详情 · {{ detail.revocation.respondent_id }}</h1>
+      <p class="sub">相关导出曾交付给哪些下游 · 据此通知回收</p>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section class="card wide">
+      <h2>撤回信息</h2>
+      <p class="hint">
+        编号 <code>{{ detail.revocation.respondent_id }}</code> ·
+        撤回时间 {{ detail.revocation.revoked_at | short_time }} ·
+        删除语料 {{ detail.revocation.deleted_rows }} 行 ·
+        受影响导出 {{ detail.exports | length }} 个
+      </p>
+      <p class="hint small">
+        语料正文已删除，本页不展示任何文本内容；换号使用同一被撤回文本的导出也已列入。
+        「交付未确认」表示读取中断或服务重启，下游可能已持有完整或部分文件，同样需要回收。
+      </p>
+    </section>
+
+    {% for item in detail.exports %}
+    <section class="card wide">
+      <h2>{{ item.export.download_name }}</h2>
+      <p class="hint">
+        批次 {{ item.export.batch }} · {{ item.export.row_count }} 行 ·
+        文件状态「{{ item.export.status | status_label }}」
+        {% if item.export.purge_reason %} · {{ item.export.purge_reason }}{% endif %}
+      </p>
+      {% if item.requisitions %}
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr><th>接收编号</th><th>登记时间</th><th>完成时间</th><th>状态</th><th>说明</th></tr>
+          </thead>
+          <tbody>
+            {% for r in item.requisitions %}
+            <tr>
+              <td class="mono">{{ r.recipient_id }}</td>
+              <td class="mono">{{ r.requested_at | short_time }}</td>
+              <td class="mono">{{ r.finished_at | short_time }}</td>
+              <td><span class="pill pill-{{ r.status }}">{{ r.status | status_label }}</span></td>
+              <td class="msg">{{ r.note or "" }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <p class="hint">该导出没有领用记录，未曾交付下游。</p>
+      {% endif %}
+    </section>
+    {% else %}
+    <section class="card wide">
+      <p class="hint">没有受影响的导出文件，无需通知下游。</p>
+    </section>
+    {% endfor %}
+
+    <div class="row"><a class="btn btn-ghost" href="/">返回首页</a></div>
+  </main>
+</body>
+</html>

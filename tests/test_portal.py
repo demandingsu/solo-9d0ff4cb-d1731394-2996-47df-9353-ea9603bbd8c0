@@ -54,6 +54,19 @@ def wait_for(instance: Portal, job_id: int, timeout: float = 5.0) -> dict:
     raise AssertionError(f"job {job_id} did not settle")
 
 
+def read_download(instance: Portal, export_id: int, recipient: str = "RCV-1"):
+    """Registered download read to completion; returns (content | None, error)."""
+    ticket = instance.register_download(export_id, recipient)
+    if ticket.error is not None or ticket.file is None:
+        return None, ticket.error or "无法下载"
+    data = ticket.file.read()
+    ticket.file.close()
+    instance.finish_download(
+        ticket.requisition_id, len(data), len(data) == ticket.size_bytes
+    )
+    return data, None
+
+
 # ---------------------------------------------------------------------------
 # ingestion
 # ---------------------------------------------------------------------------
@@ -86,10 +99,9 @@ def test_generation_produces_csv_for_selected_batch(portal):
     assert job["status"] == "completed"
 
     export = portal.exports()[0]
-    handle, name, error = portal.open_download(export["id"])
-    assert error is None and handle is not None
-    content = handle.read().decode("utf-8")
-    handle.close()
+    data, error = read_download(portal, export["id"])
+    assert error is None and data is not None
+    content = data.decode("utf-8")
     assert "春天第一段访谈正文" in content
     assert "另一个批次的正文" not in content
     assert content.splitlines()[0] == "batch,respondent_id,text"
@@ -115,8 +127,8 @@ def test_revocation_deletes_rows_and_locks_existing_exports(portal):
     assert result["deleted_rows"] == 1
     assert result["affected_exports"] == 1
 
-    handle, _name, error = portal.open_download(export_id)
-    assert handle is None
+    content, error = read_download(portal, export_id)
+    assert content is None
     assert "撤回" in error
     assert not [e for e in portal.exports() if e["id"] == export_id and e["status"] == "ready"]
 
@@ -131,9 +143,8 @@ def test_revocation_keeps_unaffected_files_downloadable(portal):
 
     portal.revoke("R1")
 
-    handle, _name, error = portal.open_download(exports["B2"]["id"])
-    assert error is None and handle is not None
-    handle.close()
+    content, error = read_download(portal, exports["B2"]["id"])
+    assert error is None and content is not None
 
 
 def test_revocation_blocks_later_upload_of_same_id(portal):
@@ -165,11 +176,13 @@ def test_revocation_is_persistent_across_restart(tmp_path):
 
     second = Portal(data_dir)
     try:
-        handle, _name, error = second.open_download(1) if second.exports() else (None, "", "")
+        content, error = (None, "")
+        if second.exports():
+            content, error = read_download(second, second.exports()[0]["id"])
         assert second.stats()["revocations"] == 1
         result = upload(second, "batch,respondent_id,text\nB1,R2,换新文本再试\n")
         assert result["skipped_revoked"] == 1
-        assert handle is None
+        assert content is None
     finally:
         second.shutdown()
 
@@ -184,18 +197,16 @@ def test_revocation_of_any_respondent_leaves_consistent_state(portal, respondent
     in_batch = respondent in {"R1", "R2", "R3"}
     for export in portal.exports():
         if export["status"] == "ready":
-            handle, _name, error = portal.open_download(export["id"])
+            content, error = read_download(portal, export["id"])
             assert error is None
-            handle.close()
 
     export_id = portal.exports()[0]["id"]
-    handle, _n, error = portal.open_download(export_id)
+    content, error = read_download(portal, export_id)
     if in_batch:
-        assert handle is None and "撤回" in error
+        assert content is None and "撤回" in error
     else:
         # A respondent from another batch must not take this file down.
-        assert handle is not None and error is None
-        handle.close()
+        assert content is not None and error is None
 
 
 # ---------------------------------------------------------------------------
@@ -259,8 +270,8 @@ def test_delete_failure_leaves_pending_and_blocks_download(portal):
     assert export["last_delete_error"]
     assert export["delete_attempts"] >= 1
 
-    handle, _name, error = portal.open_download(export_id)
-    assert handle is None and error
+    content, error = read_download(portal, export_id)
+    assert content is None and error
 
     # The file still exists on disk but is not reachable under a download name
     # until the cleanup budget is exhausted.
@@ -294,8 +305,8 @@ def test_restart_continues_pending_cleanup_and_never_reopens(tmp_path):
         pending = next(e for e in first.exports() if e["id"] == export_id)
         assert pending["status"] == "pending_delete"
         assert (first.export_dir / pending["stored_name"]).exists()
-        handle, _n, error = first.open_download(export_id)
-        assert handle is None
+        content, error = read_download(first, export_id)
+        assert content is None
     finally:
         first.shutdown()
 
@@ -307,8 +318,8 @@ def test_restart_continues_pending_cleanup_and_never_reopens(tmp_path):
         time.sleep(0.4)
         row = next(e for e in second.exports() if e["id"] == export_id)
         assert row["status"] == "pending_delete"
-        handle, _n, error = second.open_download(export_id)
-        assert handle is None and error
+        content, error = read_download(second, export_id)
+        assert content is None and error
 
         # Clearing the switch lets the retry succeed; the file is gone for good.
         second.db.set_settings({"delete_always_fail": "0"})
@@ -350,8 +361,8 @@ def test_startup_sweeps_orphan_files_and_demotes_missing_files(tmp_path):
         assert not list((data_dir / "tmp").glob("*.csv"))
         row = second.exports()[0]
         assert row["status"] == "pending_delete"
-        handle, _n, error = second.open_download(row["id"])
-        assert handle is None
+        content, error = read_download(second, row["id"])
+        assert content is None
     finally:
         second.shutdown()
 
@@ -411,14 +422,13 @@ def test_download_blocks_text_withdrawn_before_export(portal):
     wait_for(portal, job)
     export_id = portal.exports()[0]["id"]
 
-    handle, _n, error = portal.open_download(export_id)
-    assert error is None
-    handle.close()
+    content, error = read_download(portal, export_id)
+    assert error is None and content is not None
 
     portal.revoke("R-A")
 
-    handle, _n, error = portal.open_download(export_id)
-    assert handle is None and error
+    content, error = read_download(portal, export_id)
+    assert content is None and error
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
         row = next(e for e in portal.exports() if e["id"] == export_id)
@@ -426,3 +436,199 @@ def test_download_blocks_text_withdrawn_before_export(portal):
             break
         time.sleep(0.05)
     assert row["status"] == "deleted"
+
+
+# ---------------------------------------------------------------------------
+# requisition tracking (领用追踪)
+# ---------------------------------------------------------------------------
+def _ready_export(instance: Portal) -> int:
+    upload(instance, CSV_SPRING)
+    job_id = instance.create_job("B1")
+    wait_for(instance, job_id)
+    return instance.exports()[0]["id"]
+
+
+def test_direct_link_serves_registration_form_not_file(client):
+    test_client, instance = client
+    export_id = _ready_export(instance)
+
+    # The old direct link now shows the registration form, never the CSV.
+    r = test_client.get(f"/download/{export_id}")
+    assert r.status_code == 200
+    assert "接收编号" in r.text
+    assert "春天第一段访谈正文" not in r.text
+
+    # Posting without a recipient id is refused and records nothing.
+    r = test_client.post(f"/download/{export_id}", data={"recipient_id": "  "})
+    assert r.status_code == 400
+    assert "接收编号" in r.text
+    assert instance.requisitions() == []
+
+
+def test_registered_download_is_recorded_and_marked_delivered(client):
+    test_client, instance = client
+    export_id = _ready_export(instance)
+
+    r = test_client.post(f"/download/{export_id}", data={"recipient_id": "RCV-001"})
+    assert r.status_code == 200
+    assert "春天第一段访谈正文" in r.content.decode("utf-8")
+
+    reqs = instance.requisitions()
+    assert len(reqs) == 1
+    assert reqs[0]["recipient_id"] == "RCV-001"
+    assert reqs[0]["status"] == "delivered"
+    assert reqs[0]["export_id"] == export_id
+    assert reqs[0]["bytes_sent"] == instance.exports()[0]["size_bytes"]
+    assert reqs[0]["requested_at"] and reqs[0]["finished_at"]
+
+
+def test_repeated_downloads_are_each_recorded(client):
+    test_client, instance = client
+    export_id = _ready_export(instance)
+
+    for recipient in ("RCV-001", "RCV-002", "RCV-001"):
+        r = test_client.post(f"/download/{export_id}", data={"recipient_id": recipient})
+        assert r.status_code == 200
+
+    reqs = instance.requisitions()
+    assert len(reqs) == 3
+    assert [r["recipient_id"] for r in sorted(reqs, key=lambda r: r["id"])] == [
+        "RCV-001",
+        "RCV-002",
+        "RCV-001",
+    ]
+    assert all(r["status"] == "delivered" for r in reqs)
+
+
+def test_interrupted_delivery_is_unconfirmed_and_listed_in_revocation(portal):
+    export_id = _ready_export(portal)
+
+    ticket = portal.register_download(export_id, "RCV-PARTIAL")
+    assert ticket.error is None and ticket.file is not None
+    partial = ticket.file.read(16)  # client goes away after the first bytes
+    ticket.file.close()
+    portal.finish_download(ticket.requisition_id, len(partial), False)
+
+    reqs = portal.requisitions()
+    assert len(reqs) == 1
+    assert reqs[0]["status"] == "unconfirmed"
+    assert reqs[0]["bytes_sent"] == len(partial)
+
+    portal.revoke("R1")
+    detail = portal.revocation_detail("R1")
+    assert detail is not None
+    listed = [r for item in detail["exports"] for r in item["requisitions"]]
+    assert any(
+        r["recipient_id"] == "RCV-PARTIAL" and r["status"] == "unconfirmed"
+        for r in listed
+    )
+
+
+def test_restart_marks_inflight_delivery_unconfirmed(tmp_path):
+    data_dir = tmp_path / "data"
+    first = Portal(data_dir)
+    first.start_workers()
+    try:
+        export_id = _ready_export(first)
+        ticket = first.register_download(export_id, "RCV-RESTART")
+        assert ticket.error is None
+        # The process dies before the stream finishes: no finish_download call.
+        ticket.file.close()
+    finally:
+        first.shutdown()
+
+    second = Portal(data_dir)
+    try:
+        reqs = second.requisitions()
+        assert len(reqs) == 1
+        assert reqs[0]["recipient_id"] == "RCV-RESTART"
+        assert reqs[0]["status"] == "unconfirmed"
+        assert "重启" in (reqs[0]["note"] or "")
+    finally:
+        second.shutdown()
+
+
+def test_inflight_download_authorized_before_revocation_stays_recorded(portal):
+    export_id = _ready_export(portal)
+
+    # Authorized before the revocation: the descriptor is already open.
+    ticket = portal.register_download(export_id, "RCV-INFLIGHT")
+    assert ticket.error is None
+
+    portal.revoke("R2")
+
+    data = ticket.file.read()  # in-flight read still completes
+    ticket.file.close()
+    portal.finish_download(
+        ticket.requisition_id, len(data), len(data) == ticket.size_bytes
+    )
+
+    reqs = portal.requisitions()
+    assert len(reqs) == 1
+    assert reqs[0]["status"] == "delivered"
+
+    # The pre-revocation delivery shows up in the revocation impact list.
+    detail = portal.revocation_detail("R2")
+    assert detail is not None
+    listed = [r for item in detail["exports"] for r in item["requisitions"]]
+    assert [r["recipient_id"] for r in listed] == ["RCV-INFLIGHT"]
+
+    # A new download after the revocation is refused and adds no record.
+    content, error = read_download(portal, export_id, "RCV-LATE")
+    assert content is None and "撤回" in error
+    assert len(portal.requisitions()) == 1
+
+
+def test_revocation_detail_covers_same_text_under_new_id_without_text(portal):
+    upload(
+        portal,
+        "batch,respondent_id,text\n"
+        "B1,R-A,同一段访谈原文\n"
+        "B2,R-OTHER,同一段访谈原文\n",
+    )
+    for batch in ("B1", "B2"):
+        wait_for(portal, portal.create_job(batch))
+    exports = {e["batch"]: e for e in portal.exports()}
+    read_download(portal, exports["B1"]["id"], "RCV-A")
+    read_download(portal, exports["B2"]["id"], "RCV-B")
+
+    portal.revoke("R-A")
+    detail = portal.revocation_detail("R-A")
+    assert detail is not None
+
+    # The export whose copy circulates under a different id is listed too.
+    batches = {item["export"]["batch"] for item in detail["exports"]}
+    assert batches == {"B1", "B2"}
+    recipients = {
+        r["recipient_id"] for item in detail["exports"] for r in item["requisitions"]
+    }
+    assert recipients == {"RCV-A", "RCV-B"}
+    for item in detail["exports"]:
+        for r in item["requisitions"]:
+            assert r["requested_at"] and r["status"] == "delivered"
+
+    # The withdrawn text itself is nowhere in the detail payload.
+    import json
+
+    assert "同一段访谈原文" not in json.dumps(detail, ensure_ascii=False)
+
+
+def test_revocation_detail_page_lists_recipients_not_text(client):
+    test_client, instance = client
+    export_id = _ready_export(instance)
+
+    r = test_client.post(f"/download/{export_id}", data={"recipient_id": "RCV-001"})
+    assert r.status_code == 200
+    r = test_client.post("/revoke", data={"respondent_id": "R1"})
+    assert r.status_code == 200
+
+    r = test_client.get("/revocations/R1")
+    assert r.status_code == 200
+    assert "RCV-001" in r.text
+    assert "已交付" in r.text
+    assert "春天第一段访谈正文" not in r.text
+
+    # Unknown respondent falls back to the dashboard with an error.
+    r = test_client.get("/revocations/NOBODY")
+    assert r.status_code == 200
+    assert "没有找到" in r.text
